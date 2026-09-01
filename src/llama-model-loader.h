@@ -117,6 +117,12 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // Target model that owns shared draft tensors.
+    const struct llama_model * model_shared = nullptr;
+
+    // Cached nextn_shared_target_tensors value, or -1 before the first read.
+    int shared_target_tensors = -1;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -237,6 +243,9 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // Borrow omitted draft tensors when nextn_shared_target_tensors is set.
+    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
 
     void done_getting_tensors(bool partial = false) const;
 
