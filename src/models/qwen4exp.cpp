@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
@@ -13,146 +14,261 @@
 #include <utility>
 #include <vector>
 
-
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 
 llama_model_qwen4exp::llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
-llama_model_qwen4exp::~llama_model_qwen4exp() = default;
 
-#ifndef _WIN32
-// Direct-read path for the lazy PLE table (--lazy-mode on-direct).
-// The n-gram row indices of a whole ubatch are known host-side before the graph
-// runs, so the rows can be read with explicit pread()s of exactly what the gather
-// needs instead of demand-faulting file pages in through the mmap. Rows are sorted
-// (dedup + ascending file offsets) and read by a small set of worker threads, so
-// the block layer sees a sorted, parallel batch instead of one serialized page
-// fault per ~90-byte row. The table stays on disk; the kernel page cache provides
-// reuse across ubatches.
 struct llama_model_qwen4exp::ple_direct_reader {
-    ple_direct_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
-                      enum ggml_type type, int64_t head_dim)
-        : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
-          head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
-        // F32 rows have no dequantizer; they are staged as-is, like ggml_get_rows
-        GGML_ASSERT((type == GGML_TYPE_F32 || to_float != nullptr) && head_dim > 0);
-    }
-    ~ple_direct_reader() {
-        if (fd >= 0) {
-            ::close(fd);
+    ple_direct_reader(const std::string & path, size_t file_size, size_t base, size_t row_size, int64_t n_rows) :
+            base(base), row_size(row_size), n_rows(n_rows) {
+        if (row_size == 0 || row_size > UINT32_MAX || base > file_size ||
+                (uint64_t) n_rows > (file_size - base) / row_size) {
+            throw std::runtime_error("invalid PLE direct-read range");
         }
+
+#ifdef _WIN32
+        const int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, NULL, 0);
+        if (wlen == 0) {
+            throw std::runtime_error(format("failed to convert PLE path to UTF-16: Win32 error %lu", GetLastError()));
+        }
+
+        std::vector<wchar_t> wpath(wlen);
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, wpath.data(), wlen) == 0) {
+            throw std::runtime_error(format("failed to convert PLE path to UTF-16: Win32 error %lu", GetLastError()));
+        }
+
+        file = CreateFileW(wpath.data(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, NULL);
+        if (file == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error(format("failed to open PLE file for direct reads: Win32 error %lu", GetLastError()));
+        }
+#else
+        int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        fd = open(path.c_str(), flags);
+        if (fd < 0) {
+            throw std::runtime_error(format("failed to open PLE file for direct reads: %s", strerror(errno)));
+        }
+#ifdef __linux__
+        (void) posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+#endif
     }
 
-    const int      fd;
-    const size_t   base;       // file offset of row 0
-    const size_t   row_size;   // bytes per quantized row
-    const int64_t  n_rows;
-    const int      n_threads;  // in-flight read workers
-    const int64_t  head_dim;   // F32 elements per staged row
-    ggml_to_float_t to_float;  // same dequantizer the ggml_get_rows CPU kernel uses
+    ~ple_direct_reader() {
+#ifdef _WIN32
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+        }
+#else
+        if (fd >= 0) {
+            close(fd);
+        }
+#endif
+    }
 
-    // fill dst with the n gathered rows, dequantized to F32:
-    // dst[slot * head_dim, ...) = to_float(table[rows[slot]])
-    // throws on IO errors; never lets an exception escape a worker thread
-    void gather(const int32_t * rows, int64_t n, float * dst) const {
-        std::vector<std::pair<int32_t, int32_t>> pairs; // (row, dst slot)
+    void gather(const int32_t * rows, int64_t n, uint8_t * dst) const {
+        if (n < 0 || n > INT32_MAX) {
+            throw std::runtime_error("PLE direct-read batch is too large");
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> pairs;
         pairs.reserve(n);
         for (int64_t i = 0; i < n; ++i) {
-            GGML_ASSERT(rows[i] >= 0 && (int64_t) rows[i] < n_rows);
+            if (rows[i] < 0 || (int64_t) rows[i] >= n_rows) {
+                throw std::runtime_error(format("PLE row %d is out of range", rows[i]));
+            }
             pairs.emplace_back(rows[i], (int32_t) i);
         }
 
-        std::sort(pairs.begin(), pairs.end()); // equal rows adjacent, file order
+        std::sort(pairs.begin(), pairs.end());
 
-        // decodes gather a handful of rows; threads are not worth it there
-        const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, n / 32));
+        const int64_t start_us = ggml_time_us();
+#ifdef _WIN32
+        gather_win32(pairs, dst);
+#else
+        gather_posix(pairs, dst);
+#endif
+        if (n > 16) {
+            LLAMA_LOG_DEBUG("%s: staged %" PRId64 " PLE rows (%zu KiB) in %.2f ms\n",
+                    __func__, n, (size_t) n * row_size / 1024, (ggml_time_us() - start_us) / 1000.0);
+        }
+    }
 
-        // worker w reads rows pairs[n*w/n_workers, n*(w+1)/n_workers)
-        auto run_chunk = [&](int w, std::exception_ptr & err) {
+    const size_t  base;
+    const size_t  row_size;
+    const int64_t n_rows;
+
+private:
+#ifdef _WIN32
+    struct row_run {
+        int64_t begin;
+        int64_t end;
+    };
+
+    void gather_win32(const std::vector<std::pair<int32_t, int32_t>> & pairs, uint8_t * dst) const {
+        std::vector<row_run> runs;
+        for (int64_t i = 0; i < (int64_t) pairs.size();) {
+            int64_t j = i + 1;
+            while (j < (int64_t) pairs.size() && pairs[j].first == pairs[i].first) {
+                ++j;
+            }
+            runs.push_back({ i, j });
+            i = j;
+        }
+
+        constexpr size_t queue_depth = 64;
+        for (size_t first = 0; first < runs.size(); first += queue_depth) {
+            const size_t count = std::min(queue_depth, runs.size() - first);
+            std::vector<OVERLAPPED> ops(count);
+            std::vector<HANDLE> events(count, NULL);
+
+            for (size_t i = 0; i < count; ++i) {
+                events[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
+                if (events[i] == NULL) {
+                    const DWORD error = GetLastError();
+                    for (HANDLE event : events) {
+                        if (event != NULL) {
+                            CloseHandle(event);
+                        }
+                    }
+                    throw std::runtime_error(format("failed to create PLE I/O event: Win32 error %lu", error));
+                }
+                ops[i].hEvent = events[i];
+            }
+
+            size_t issued = 0;
+            DWORD error = ERROR_SUCCESS;
+            for (size_t i = 0; i < count; ++i) {
+                const row_run & run = runs[first + i];
+                const auto & pair = pairs[run.begin];
+                const uint64_t offset = base + (uint64_t) pair.first * row_size;
+                ops[i].Offset     = (DWORD) offset;
+                ops[i].OffsetHigh = (DWORD) (offset >> 32);
+
+                const BOOL ok = ReadFile(file, dst + (size_t) pair.second * row_size,
+                        (DWORD) row_size, NULL, &ops[i]);
+                if (!ok) {
+                    const DWORD read_error = GetLastError();
+                    if (read_error != ERROR_IO_PENDING) {
+                        error = read_error;
+                        break;
+                    }
+                }
+                ++issued;
+            }
+
+            for (size_t i = 0; i < issued; ++i) {
+                DWORD n_read = 0;
+                const BOOL ok = GetOverlappedResult(file, &ops[i], &n_read, TRUE);
+                if ((!ok || n_read != (DWORD) row_size) && error == ERROR_SUCCESS) {
+                    error = ok ? ERROR_HANDLE_EOF : GetLastError();
+                }
+                if (ok && n_read == (DWORD) row_size) {
+                    const row_run & run = runs[first + i];
+                    const uint8_t * src = dst + (size_t) pairs[run.begin].second * row_size;
+                    for (int64_t j = run.begin + 1; j < run.end; ++j) {
+                        memcpy(dst + (size_t) pairs[j].second * row_size, src, row_size);
+                    }
+                }
+            }
+
+            for (HANDLE event : events) {
+                CloseHandle(event);
+            }
+            if (error != ERROR_SUCCESS) {
+                throw std::runtime_error(format("PLE direct read failed: Win32 error %lu", error));
+            }
+        }
+    }
+
+    HANDLE file = INVALID_HANDLE_VALUE;
+#else
+    void gather_posix(const std::vector<std::pair<int32_t, int32_t>> & pairs, uint8_t * dst) const {
+        const int n_threads = (int) std::max(1u, std::thread::hardware_concurrency());
+        const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, pairs.size() / 256));
+
+        auto run_chunk = [&](int worker, std::exception_ptr & error) {
             try {
-                run_range(pairs, n * w / n_workers, n * (w + 1) / n_workers, dst);
+                run_range(pairs, pairs.size() * worker / n_workers, pairs.size() * (worker + 1) / n_workers, dst);
             } catch (...) {
-                err = std::current_exception();
+                error = std::current_exception();
             }
         };
 
-        // an exception leaving a joinable std::thread, or destroying one,
-        // terminates the process; keep worker creation failure-safe
-        std::vector<std::exception_ptr> errs(n_workers);
+        std::vector<std::exception_ptr> errors(n_workers);
         std::vector<std::thread> workers;
         try {
-            for (int w = 1; w < n_workers; ++w) {
-                workers.emplace_back([&run_chunk, &errs, w]() {
-                    run_chunk(w, errs[w]);
+            for (int worker = 1; worker < n_workers; ++worker) {
+                workers.emplace_back([&run_chunk, &errors, worker]() {
+                    run_chunk(worker, errors[worker]);
                 });
             }
         } catch (...) {
-            for (auto & t : workers) {
-                t.join();
+            for (auto & worker : workers) {
+                worker.join();
             }
             throw;
         }
 
-        run_chunk(0, errs[0]); // this thread takes the first chunk
-        for (auto & t : workers) {
-            t.join();
+        run_chunk(0, errors[0]);
+        for (auto & worker : workers) {
+            worker.join();
         }
-
-        for (const auto & err : errs) {
-            if (err) {
-                std::rethrow_exception(err);
+        for (const auto & error : errors) {
+            if (error) {
+                std::rethrow_exception(error);
             }
         }
     }
 
-private:
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
-                   int64_t begin, int64_t end, float * dst) const {
-        std::vector<uint8_t> bounce(row_size);
-        for (int64_t i = begin; i < end; ) {
-            int64_t j = i;
-            while (j + 1 < end && pairs[j + 1].first == pairs[i].first) {
-                ++j; // dedup: one read serves the whole run
+            int64_t begin, int64_t end, uint8_t * dst) const {
+        std::vector<uint8_t> row(row_size);
+        for (int64_t i = begin; i < end;) {
+            int64_t j = i + 1;
+            while (j < end && pairs[j].first == pairs[i].first) {
+                ++j;
             }
-            const size_t off = base + (size_t) pairs[i].first * row_size;
-            for (size_t done = 0; done < row_size; ) {
-                const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
+
+            const size_t offset = base + (size_t) pairs[i].first * row_size;
+            for (size_t done = 0; done < row_size;) {
+                const ssize_t n_read = pread(fd, row.data() + done, row_size - done, offset + done);
                 if (n_read < 0 && errno == EINTR) {
-                    continue; // interrupted by a signal without SA_RESTART
+                    continue;
                 }
                 if (n_read <= 0) {
-                    throw std::runtime_error(format("PLE direct read of %zu bytes at file offset %zu failed: %s",
-                            row_size, off, n_read == 0 ? "unexpected EOF" : strerror(errno)));
+                    throw std::runtime_error(format("PLE direct read failed: %s",
+                            n_read == 0 ? "unexpected EOF" : strerror(errno)));
                 }
                 done += n_read;
             }
-            float * first = dst + (size_t) pairs[i].second * head_dim;
-            if (to_float) {
-                to_float(bounce.data(), first, head_dim);
-            } else {
-                memcpy(first, bounce.data(), (size_t) head_dim * sizeof(float));
+
+            for (int64_t k = i; k < j; ++k) {
+                memcpy(dst + (size_t) pairs[k].second * row_size, row.data(), row_size);
             }
-            for (int64_t k = i + 1; k <= j; ++k) {
-                memcpy(dst + (size_t) pairs[k].second * head_dim, first, (size_t) head_dim * sizeof(float));
-            }
-            i = j + 1;
+            i = j;
         }
     }
-};
 
-// matching interface so the call sites compile; never constructed on this
-// platform, see load_arch_tensors
-#else
-struct llama_model_qwen4exp::ple_direct_reader {
-    const int64_t head_dim = 0;
-
-    void gather(const int32_t *, int64_t, float *) const {
-        GGML_ABORT("PLE direct reads are not supported on this platform");
-    }
-};
+    int fd = -1;
 #endif
+};
+
+llama_model_qwen4exp::~llama_model_qwen4exp() = default;
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -286,41 +402,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
-        // --lazy-mode on-direct: read the gathered rows with explicit pread()s
-        // instead of faulting them in through the mmap
         if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
-#ifndef _WIN32
-            // an independent buffered descriptor: dup() would share the loader's
-            // open file description, whose readahead advice and O_DIRECT flag
-            // (init_mappings applies POSIX_FADV_SEQUENTIAL, --load-mode dio)
-            // would fight the small scattered row reads
-            const int fd = ::open(ml.files[ple_w.idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
-            if (fd < 0) {
-                // e.g. a FILE*-backed model has no reopenable path; the tensor is
-                // still lazy, so keep serving it through the mmap reads
-                LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
-                        __func__, ml.files[ple_w.idx]->name().c_str(), strerror(errno));
-            } else {
-#ifdef __linux__
-                // rows are tiny and scattered, so sequential readahead would be
-                // pure waste; Darwin has no posix_fadvise
-                ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
-#endif
-
-                // in-flight reads are IO queue depth, not compute; 2x cores worked
-                // well on NVMe and stays sane on smaller machines
-                const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
-
-                ple_reader = std::make_unique<ple_direct_reader>(fd, ple_w.offs,
-                        ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]), ple_rows, n_threads,
-                        per_layer_tok_embd->type, hparams.ple_head_dim);
-
-                LLAMA_LOG_INFO("%s: PLE direct read enabled: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
-                        __func__, ple_rows, ple_reader->row_size, ple_w.offs, n_threads);
+            try {
+                const auto & file = ml.files[ple_w.idx];
+                ple_reader = std::make_unique<ple_direct_reader>(file->name(), file->size(), ple_w.offs,
+                        ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]), ple_rows);
+                LLAMA_LOG_INFO("%s: PLE direct reads enabled: %" PRId64 " rows of %zu bytes\n",
+                        __func__, ple_rows, ple_reader->row_size);
+            } catch (const std::exception & error) {
+                LLAMA_LOG_WARN("%s: PLE direct reads unavailable (%s), using lazy mmap reads\n",
+                        __func__, error.what());
             }
-#else
-            LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
-#endif
         }
     }
 
@@ -1165,11 +1257,11 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         const int64_t n = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
-        return pmodel.ple_reader ? data->ne[1] == n : rows->ne[0] == n;
+        return rows->ne[0] == n && (!pmodel.ple_reader || data->ne[1] == n);
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
-    ggml_tensor * data = nullptr;   // direct mode: staged rows [ple_head_dim, ple_n_heads * n_tokens]
+    ggml_tensor * data = nullptr;   // direct mode: staged quantized rows
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1178,7 +1270,9 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
-    std::vector<uint8_t> staging; // direct mode: host side of `data`
+    std::vector<int32_t> idx;
+    std::vector<int32_t> direct_rows;
+    std::vector<uint8_t> staging;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1201,7 +1295,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t eos      = hp.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    idx.resize(n_heads * n_tokens);
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -1217,7 +1311,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         // an EOS in the window resets everything at or before it
         // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
+        std::array<int64_t, LLAMA_MAX_PLE_NGRAM> ctx;
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
@@ -1242,11 +1336,22 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     if (pmodel.ple_reader) {
-        staging.resize(idx.size() * pmodel.ple_reader->head_dim * sizeof(float));
-        pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), (float *) staging.data());
+        const size_t old_size = direct_rows.size();
+        direct_rows.resize(idx.size());
+        if (old_size != direct_rows.size()) {
+            for (size_t i = 0; i < direct_rows.size(); ++i) {
+                direct_rows[i] = (int32_t) i;
+            }
+        }
+
+        staging.resize(idx.size() * pmodel.ple_reader->row_size);
+        pmodel.ple_reader->gather(idx.data(), (int64_t) idx.size(), staging.data());
+
+        GGML_ASSERT(ggml_nbytes(data) == staging.size());
         ggml_backend_tensor_set(data, staging.data(), 0, staging.size());
+        ggml_backend_tensor_set(rows, direct_rows.data(), 0, direct_rows.size() * sizeof(int32_t));
     } else {
-        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size() * sizeof(int32_t));
     }
 }
 
@@ -1314,31 +1419,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ggml_tensor * emb = nullptr;
+    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+    ggml_set_input(ple_inp->rows);
+    ggml_tensor * rows = ple_inp->rows;
 
+    ggml_tensor * table = model.per_layer_tok_embd;
     if (static_cast<const llama_model_qwen4exp &>(model).ple_reader) {
-        // direct-read mode: set_input() pre-gathers the rows host-side, so the
-        // staged tensor replaces ggml_get_rows and the table pages stay untouched
-        // F32 matches the ggml_get_rows output type, so the downstream mul_mats
-        // take the same kernels as the baseline path
-        ple_inp->data = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
-                                           hparams.ple_head_dim, n_heads * n_tokens);
+        ple_inp->data = ggml_new_tensor_2d(ctx0, model.per_layer_tok_embd->type,
+                hparams.ple_head_dim, n_heads * n_tokens);
         ggml_set_input(ple_inp->data);
-        ggml_tensor * data = ple_inp->data;
-        res->add_input(std::move(ple_inp));
-
-        // flatten the heads the same way ggml_get_rows would: slowest dimension
-        emb = ggml_reshape_2d(ctx0, data, hparams.ple_head_dim * n_heads, n_tokens);
-    } else {
-        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-        ggml_set_input(ple_inp->rows);
-        ggml_tensor * rows = ple_inp->rows;
-        res->add_input(std::move(ple_inp));
-
-        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        table = ple_inp->data;
     }
+
+    res->add_input(std::move(ple_inp));
+
+    // get_rows dequantizes the compact staged rows
+    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
+    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
     return emb;

@@ -93,6 +93,7 @@ struct llama_file::impl {
         size = tell();
         seek(0, SEEK_SET);
     }
+
     impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
@@ -405,12 +406,10 @@ llama_file::~llama_file() = default;
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
+const std::string & llama_file::name() const { return pimpl->fname; }
+
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
-
-const std::string & llama_file::name() const {
-    return pimpl->fname;
-}
 
 int llama_file::file_id() const {
 #ifdef _WIN32
