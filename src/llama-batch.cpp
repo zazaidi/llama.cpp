@@ -261,7 +261,11 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (batch.token) {
+            // An MTP hook batch carries BOTH a token (the next-token id) and embd (the
+            // h_nextn row) - see llama_context::decode. It is an embedding-style batch,
+            // so it may legitimately reuse the current position (X == Y) and must not be
+            // held to the token-only rule of X < Y. Only a pure token batch is strict.
+            if (batch.token && !batch.embd) {
                 if (p0 >= 0 && p0 >= seq_pos_min(s)) {
                     LLAMA_LOG_ERROR(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
